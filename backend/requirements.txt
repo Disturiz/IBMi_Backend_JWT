@@ -1,0 +1,8 @@
+
+fastapi
+uvicorn[standard]
+jaydebeapi
+pandas
+python-multipart
+openpyxl
+PyJWT

@@ -1,0 +1,14 @@
+
+services:
+  backend:
+    build: ./backend
+    environment:
+      - JT400_JAR=/app/drivers/jt400.jar
+      - JWT_SECRET=dev-CHANGE-ME
+      - JWT_EXPIRE_MIN=5
+      # - ALLOW_LIBS=QIWS,MYLIB
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/drivers:/app/drivers:ro
+    restart: unless-stopped
