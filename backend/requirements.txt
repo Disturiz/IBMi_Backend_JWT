@@ -1,8 +1,38 @@
+# Framework principal
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
 
-fastapi
-uvicorn[standard]
-jaydebeapi
-pandas
-python-multipart
-openpyxl
-PyJWT
+# Validación de datos
+pydantic==1.10.14
+
+# JWT (Tokens)
+PyJWT==2.9.0
+python-jose[cryptography]==3.3.0
+
+# Cliente HTTP (para n8n, APIs externas)
+httpx==0.27.0
+
+# Conexión a IBM i vía JDBC
+jaydebeapi==1.2.3
+JPype1==1.5.0
+
+# DataFrames y exportaciones
+pandas==2.2.2
+openpyxl==3.1.4  # Excel
+xlrd==2.0.1      # Leer XLS antiguos
+
+# Utilidades
+python-dotenv==1.0.1  # Manejo de .env
+
+# --- Exportación de datos ---
+pandas>=2.2.2
+openpyxl>=3.1.2
+# (Opcional) Acelera conversiones CSV/XLSX grandes y otros formatos columnares
+pyarrow>=16.1.0
+
+# --- IBM i (elige una vía si corresponde) ---
+# Opción 1: ODBC (recomendado si ya usas IBM i Access ODBC)
+# pyodbc>=5.1.0
+
+# Opción 2: Cliente nativo
+# ibm-db==3.2.6

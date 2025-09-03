@@ -1,0 +1,15 @@
+
+N8N_WEBHOOK_URL="http://localhost:5678/webhook/ingest_ibmi"  # tu webhook de n8n
+#N8N_API_KEY=""                                 # (solo si tu n8n exige API Key)
+
+# ---- JWT ----
+JWT_SECRET=jSZ0QT9KgKao3AI_cBdk9wqcm43mAvqc63f4TzHVm9Y
+JWT_ALGORITHM=HS256
+JWT_EXP_MINUTES=60
+
+# ---- IBM i / JDBC ----
+JT400_JAR=C:\Users\distu\Documents\IBM\jt400.jar
+IBMI_JDBC_URL="jdbc:as400://PUB400.COM;naming=system;errors=full;prompt=false;translate binary=false"
+IBMI_USER="GLEARN21"
+IBMI_PASSWORD="douglas$63"
+
