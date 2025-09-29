@@ -1,97 +1,213 @@
-# app/routes/kpis.py
+# backend/app/routes/kpis.py
+from __future__ import annotations
+
 import os
-import httpx
-from typing import Any, Dict, Optional
-from fastapi import APIRouter, Depends, HTTPException, Header
+from pathlib import Path
+from datetime import date
+from typing import Optional, Literal
+
+from dotenv import load_dotenv
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import jwt  # PyJWT
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 
-router = APIRouter(prefix="/kpis", tags=["kpis"])
+# === Cargar .env (backend/.env) ===
+ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(ENV_PATH, override=True)
 
-# --- Config vía entorno ---
-N8N_BASE_URL = os.getenv("N8N_BASE_URL", "http://localhost:5678")
-# Usa /webhook para producción; /webhook-test para pruebas
-N8N_ENDPOINT = os.getenv("N8N_ENDPOINT", "/webhook/etl-ibmi-kpis")
-N8N_API_KEY = os.getenv("N8N_API_KEY")  # opcional
-REQUEST_TIMEOUT = float(os.getenv("N8N_TIMEOUT_SEC", "60"))
+router = APIRouter()
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")  # cámbialo en prod
-JWT_ALG = os.getenv("JWT_ALG", "HS256")
-JWT_AUD = os.getenv("JWT_AUD")  # opcional (audience)
-JWT_ISS = os.getenv("JWT_ISS")  # opcional (issuer)
+# === Engine perezoso (PG_DSN o variables separadas) ===
+_ENGINE = None  # cache global
 
 
-class Filters(BaseModel):
+def _build_engine_now():
+    dsn = (os.getenv("PG_DSN") or "").strip()
+    if dsn:
+        eng = create_engine(dsn, pool_pre_ping=True, future=True)
+        print(f"[DB] Using PG_DSN | driver={eng.dialect.driver}")
+        return eng
+
+    host = os.getenv("PG_HOST")
+    user = os.getenv("PG_USER")
+    password = os.getenv("PG_PASSWORD")
+    port = int(os.getenv("PG_PORT", "6543"))
+    db = os.getenv("PG_DB", "postgres")
+    sslmode = os.getenv("PG_SSLMODE", "require")
+
+    missing = []
+    if not host:
+        missing.append("PG_HOST")
+    if not user:
+        missing.append("PG_USER")
+    if not password:
+        missing.append("PG_PASSWORD")
+    if missing:
+        raise RuntimeError(
+            "Config DB incompleta. Faltan: "
+            + ", ".join(missing)
+            + ". Define PG_DSN o bien PG_HOST/PG_USER/PG_PASSWORD."
+        )
+
+    url = URL.create(
+        "postgresql+psycopg",  # psycopg v3
+        username=user,
+        password=password,  # texto plano
+        host=host,
+        port=port,
+        database=db,
+        query={"sslmode": sslmode},
+    )
+    eng = create_engine(url, pool_pre_ping=True, future=True)
+    print(f"[DB] Using parts | driver={eng.dialect.driver}")
+    return eng
+
+
+def _get_engine():
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _build_engine_now()
+    return _ENGINE
+
+
+# === Config tabla/vista de KPIs ===
+PG_SCHEMA = os.getenv("PG_SCHEMA", "analytics")
+PG_TABLE = os.getenv("PG_TABLE", "ventaspf_utf8")
+
+
+# === Modelos / utilidades ===
+class KpiQuery(BaseModel):
+    date_from: date
+    date_to: date
+    series_granularity: Literal["daily", "weekly", "monthly"] = "monthly"
     country: Optional[str] = None
     city: Optional[str] = None
-    date_from: Optional[str] = None
-    date_to: Optional[str] = None
-    series_granularity: Optional[str] = None  # daily|weekly|monthly|quarterly|yearly
-    limit_top: Optional[int] = 10
-    # Cualquier otro filtro que uses en n8n:
-    # zone: Optional[str] = None
-    # product_code: Optional[str] = None
-    # ...
+    limit_top: int = 10
+    top_dim: Literal["product", "city", "country"] = "product"
+    metric: Literal["totalrev", "qty"] = "totalrev"
 
 
-def require_jwt(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
-    """
-    Valida un JWT en el header Authorization: Bearer <token>
-    Devuelve el payload decodificado si es válido.
-    """
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=401, detail="Missing or invalid Authorization header"
-        )
+def _granularity_token(g: str) -> str:
+    return {"daily": "day", "weekly": "week", "monthly": "month"}[g]
 
-    token = authorization.split(" ", 1)[1].strip()
-    options = {"verify_aud": bool(JWT_AUD)}  # solo verifica aud si está configurado
+
+def _label_column(dim: str) -> str:
+    return {"product": "product", "city": "city", "country": "country"}[dim]
+
+
+# === Endpoint de diagnóstico rápido ===
+@router.get("/__dbg/check")
+def dbg_check():
     try:
-        payload = jwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=[JWT_ALG],
-            audience=JWT_AUD if JWT_AUD else None,
-            issuer=JWT_ISS if JWT_ISS else None,
-            options=options,
-        )
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+        eng = _get_engine()
+        with eng.begin() as conn:
+            who = conn.execute(
+                text("select current_user, current_database()")
+            ).fetchone()
+            tbl = f"{PG_SCHEMA}.{PG_TABLE}"
+            exists = conn.execute(text("select to_regclass(:t)"), {"t": tbl}).scalar()
+        return {
+            "ok": True,
+            "user": who[0],
+            "db": who[1],
+            "table": tbl,
+            "table_exists": bool(exists),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
-@router.post("/query")
-async def kpis_query(filters: Filters, user=Depends(require_jwt)):
+# === Endpoint principal KPIs ===
+@router.post("/kpis/query")
+def kpis_query(q: KpiQuery):
+    gran = _granularity_token(q.series_granularity)
+    label_col = _label_column(q.top_dim)
+    metric_col = "totalrev" if q.metric == "totalrev" else "qty"
+    qualified = f'"{PG_SCHEMA}"."{PG_TABLE}"'
+
+    # CTE filtrado con CAST explícito para evitar ambigüedad de tipos
+    base_cte = f"""
+    WITH filtered AS (
+        SELECT
+            orderdate::date AS d,
+            qty, totalrev, product, city, country
+        FROM {qualified}
+        WHERE (orderdate::text ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$' OR orderdate::text IS NOT NULL)
+          AND orderdate::date BETWEEN :date_from AND :date_to
+          AND (COALESCE(CAST(:country AS text), '') = '' OR country = CAST(:country AS text))
+          AND (COALESCE(CAST(:city    AS text), '') = '' OR city    = CAST(:city    AS text))
+    )
     """
-    Proxy autenticado: Frontend -> Backend (JWT) -> n8n
-    Reenvía el JSON de filtros al webhook de n8n y devuelve el JSON resultante.
-    """
-    url = f"{N8N_BASE_URL}{N8N_ENDPOINT}"
-    headers = {"Content-Type": "application/json"}
 
-    if N8N_API_KEY:
-        # Si protegiste el webhook con API Key personalizada en n8n
-        headers["X-N8N-API-KEY"] = N8N_API_KEY
+    timeseries_sql = text(
+        base_cte
+        + """
+        SELECT
+            date_trunc(CAST(:granularity AS text), d) AS dt,
+            SUM(totalrev) AS totalrev,
+            SUM(qty)      AS qty
+        FROM filtered
+        GROUP BY 1
+        ORDER BY 1
+        """
+    )
 
-    # Puedes adjuntar metadata de usuario si te sirve en n8n:
-    payload = filters.model_dump()
-    payload["_auth"] = {
-        "sub": user.get("sub"),
-        "roles": user.get("roles"),
-        "iss": user.get("iss"),
+    top_sql = text(
+        base_cte
+        + f"""
+        SELECT
+            {label_col} AS label,
+            SUM(totalrev) AS totalrev,
+            SUM(qty)      AS qty
+        FROM filtered
+        GROUP BY {label_col}
+        ORDER BY SUM({metric_col}) DESC
+        LIMIT :limit_top
+        """
+    )
+
+    params = {
+        "date_from": q.date_from,
+        "date_to": q.date_to,
+        "granularity": gran,  # 'day' | 'week' | 'month'
+        "country": q.country,
+        "city": q.city,
+        "limit_top": q.limit_top,
     }
 
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+        with _get_engine().begin() as conn:
+            ts_rows = [dict(r._mapping) for r in conn.execute(timeseries_sql, params)]
+            top_rows = [dict(r._mapping) for r in conn.execute(top_sql, params)]
 
-        if resp.status_code >= 400:
-            # Regresa el texto de error de n8n para depurar
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-        return resp.json()
-    except httpx.RequestError as e:
-        # Errores de red, timeouts, DNS, etc.
-        raise HTTPException(status_code=502, detail=f"Upstream error (n8n): {e}")
+        return {
+            "meta": {
+                "date_from": str(q.date_from),
+                "date_to": str(q.date_to),
+                "series_granularity": q.series_granularity,
+                "applied_filters": {"country": q.country, "city": q.city},
+                "metric": q.metric,
+                "top_dim": q.top_dim,
+                "limit_top": q.limit_top,
+            },
+            "timeseries": [
+                {
+                    "dt": r["dt"].date().isoformat(),
+                    "totalrev": float(r["totalrev"] or 0),
+                    "qty": float(r["qty"] or 0),
+                }
+                for r in ts_rows
+            ],
+            "top": [
+                {
+                    "label": (r["label"] or "N/A"),
+                    "totalrev": float(r["totalrev"] or 0),
+                    "qty": float(r["qty"] or 0),
+                }
+                for r in top_rows
+            ],
+            "top_dim": q.top_dim,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
